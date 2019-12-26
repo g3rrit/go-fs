@@ -2,9 +2,13 @@ package main
 
 import (
   "fmt"
+  "bufio"
+  "strings"
   "os"
   "net"
   "encoding/binary"
+  "crypto/aes"
+  "crypto/cipher"
 )
 
 func exit(err string) {
@@ -12,7 +16,7 @@ func exit(err string) {
   os.Exit(0)
 }
 
-func sendFile(client string, port string, file string) {
+func sendFile(client string, port string, file string, cp cipher.Block) {
   f, err := os.Open("./" + file)
   if err != nil {
     exit("unable to open file: " + file)
@@ -62,14 +66,16 @@ func sendFile(client string, port string, file string) {
   // SEND FILE
   readWrite(func (b []byte) (int, error) {
     return f.Read(b)
-  }, func (b []byte) (int, error) {
+  }, func (b []byte) {
+    cp.Encrypt(b, b)
+  }, func (b []byte, length int) (int, error) {
     return s.Write(b)
-  }, fileSize)
+  }, cp.BlockSize(), fileSize)
 
   fmt.Println("Done sending file")
 }
 
-func recvFile(host string, port string, file string) {
+func recvFile(host string, port string, file string, cp cipher.Block) {
   f, err := os.Create("./" + file)
   if err != nil {
     exit("unable to open file: " + file)
@@ -97,27 +103,39 @@ func recvFile(host string, port string, file string) {
   // RECEIVE DATA
   readWrite(func (b []byte) (int, error) {
     return s.Read(b)
-  }, func (b []byte) (int, error) {
-    return f.Write(b)
-  }, fileSize)
+  }, func(b []byte) {
+    cp.Decrypt(b, b)
+  },func (b []byte, length int) (int, error) {
+    return f.Write(b[:length])
+  }, cp.BlockSize(), fileSize)
 
   fmt.Println("Done receiving file")
 }
 
-func readWrite(read func(b []byte) (int, error), write func(b []byte) (int, error), size int64) {
+func readWrite(read func(b []byte) (int, error),
+    mmap func(b []byte),
+    write func(b []byte, length int) (int, error),
+    blockSize int, size int64) {
   var bytes int64 = 0
-  dataSize := 4096
-  data := make([]byte, dataSize)
+  data := make([]byte, blockSize)
   for {
+    for i := range data {
+      data[i] = 0
+    }
+
     length, err := read(data)
     if err != nil {
       exit("unable to read")
     }
-    _, err = write(data[:length])
+    mmap(data)
+    _, err = write(data, length)
     if err != nil {
       exit("unable to write")
     }
     bytes += int64(length)
+    if bytes >= size {
+      bytes = size
+    }
     fmt.Printf("\033[2K\r%d / %d", bytes, size)
     if bytes == size {
       break
@@ -127,26 +145,64 @@ func readWrite(read func(b []byte) (int, error), write func(b []byte) (int, erro
 }
 
 func printUsage() {
-  fmt.Println("usage: ./fs [s|r] [file] [ip] [port]")
+  fmt.Println("usage: fs [s|r] [file] [ip] [port]")
+}
+
+func read(reader *bufio.Reader) string {
+  res, err := reader.ReadString('\n')
+  if err != nil {
+    exit("unable to read from stdin")
+  }
+  res = strings.Replace(res, "\n", "", -1)
+  return res
 }
 
 func main() {
-  fmt.Println("GO FS")
-  args := os.Args[1:]
+  fmt.Println(" ----- GO FS ----- ")
 
-  if len(args) != 4 {
-    printUsage()
-    os.Exit(0)
+  reader := bufio.NewReader(os.Stdin)
+
+  var sr   string
+  var host string
+  var port string
+  var file string
+  var key  string
+
+  fmt.Print("Send or Receive [s|r]: ")
+  sr = read(reader)
+
+  fmt.Print("Host (IPv6): ")
+  host = read(reader)
+
+  fmt.Print("Port: ")
+  port = read(reader)
+
+  fmt.Print("File: ")
+  file = read(reader)
+
+  fmt.Print("Key (32 bytes): ")
+  key = read(reader)
+  if len(key) != 32 {
+    exit("invalid key length")
   }
 
-  switch args[0] {
+  cp, err := aes.NewCipher([]byte(key))
+  if err != nil {
+    exit("unable to construct cipher from key")
+  }
+
+  fmt.Println("Block Size", cp.BlockSize())
+
+  switch sr {
   case "s":
-    fmt.Println("Sending", args[1], "to", args[2])
-    sendFile(args[2], args[3], args[1])
+    fmt.Println("Sending", file, "to", host)
+    sendFile(host, port, file, cp)
   case "r":
-    fmt.Println("Receiving", args[1], "from", args[2])
-    recvFile(args[2], args[3], args[1])
+    fmt.Println("Receiving", file, "from", host)
+    recvFile(host, port, file, cp)
   default:
     printUsage()
   }
+
+  fmt.Println(" ----- ----- ----- ")
 }
